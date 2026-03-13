@@ -338,6 +338,57 @@ pre {
   gap: 16px;
 }
 
+/* ── Debug panel ── */
+.debug-card { opacity: 0.7; }
+.debug-card:hover { opacity: 1; }
+.debug-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  user-select: none;
+}
+.debug-header h2 { margin: 0; font-size: 0.9rem; }
+.debug-arrow { font-size: 0.9rem; color: #8890a0; }
+.debug-body { margin-top: 12px; }
+.debug-separator {
+  border-top: 1px solid #282d38;
+  margin: 12px 0;
+}
+.debug-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #8890a0;
+  margin: 0 0 8px;
+}
+.debug-tests {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.debug-results { margin-top: 10px; }
+.debug-grid { font-size: 0.85rem; }
+.debug-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 0.82rem;
+}
+.debug-val {
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: #6b9bff;
+  background: #1a1e28;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+button.small {
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  margin-top: 0;
+}
+
 @media (max-width: 760px) {
   .container { padding: 0 8px 20px; }
 }

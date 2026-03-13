@@ -1204,5 +1204,135 @@ def research_cancel():
     return jsonify({"ok": True, "status": "canceled"})
 
 
+# ── Debug routes ──
+
+@app.get("/debug/env")
+def debug_env():
+    """Return env var presence status and config values (no secrets)."""
+    return jsonify({
+        "env_vars": {
+            "ANTHROPIC_API_KEY": bool(API_KEY),
+            "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+            "TAVILY_API_KEY": bool(os.getenv("TAVILY_API_KEY")),
+            "TWITTERAPI_KEY": bool(TWITTERAPI_KEY),
+            "YOUTUBE_API_KEY": bool(YOUTUBE_API_KEY),
+            "REDIS_URL": bool(REDIS_URL),
+        },
+        "config": {
+            "ANTHROPIC_MODEL": MODEL or "(default fallback)",
+            "GPTR_ENABLED": GPTR_ENABLED,
+            "GPTR_SMART_LLM": GPTR_SMART_LLM,
+            "GPTR_FAST_LLM": GPTR_FAST_LLM,
+            "GPTR_STRATEGIC_LLM": GPTR_STRATEGIC_LLM,
+            "GPTR_RETRIEVER": GPTR_RETRIEVER,
+            "GPTR_MAX_PASSES": GPTR_MAX_PASSES,
+            "GPTR_MIN_SOURCES": GPTR_MIN_SOURCES,
+            "RESEARCH_USE_WORKER": RESEARCH_USE_WORKER,
+        },
+    })
+
+
+@app.post("/debug/test")
+def debug_test():
+    """Test connectivity to a specific service."""
+    data = request.get_json(force=True, silent=True) or {}
+    service = data.get("service", "")
+    result = {"service": service, "ok": False, "detail": ""}
+
+    try:
+        if service == "anthropic":
+            if not API_KEY:
+                result["detail"] = "ANTHROPIC_API_KEY not set"
+            else:
+                from anthropic import Anthropic
+                client = Anthropic(api_key=API_KEY, timeout=15.0)
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=10,
+                    messages=[{"role": "user", "content": "Say OK"}],
+                )
+                result["ok"] = True
+                result["detail"] = f"Model responded: {_extract_text_from_message(msg)[:50]}"
+
+        elif service == "openai":
+            oai_key = os.getenv("OPENAI_API_KEY", "")
+            if not oai_key:
+                result["detail"] = "OPENAI_API_KEY not set"
+            else:
+                import openai
+                client = openai.OpenAI(api_key=oai_key)
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    max_tokens=10,
+                    messages=[{"role": "user", "content": "Say OK"}],
+                )
+                result["ok"] = True
+                result["detail"] = f"Model responded: {resp.choices[0].message.content[:50]}"
+
+        elif service == "tavily":
+            tavily_key = os.getenv("TAVILY_API_KEY", "")
+            if not tavily_key:
+                result["detail"] = "TAVILY_API_KEY not set"
+            else:
+                r = http_requests.post(
+                    "https://api.tavily.com/search",
+                    json={"api_key": tavily_key, "query": "test", "max_results": 1},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                results_count = len(r.json().get("results", []))
+                result["ok"] = True
+                result["detail"] = f"Search returned {results_count} result(s)"
+
+        elif service == "twitter":
+            if not TWITTERAPI_KEY:
+                result["detail"] = "TWITTERAPI_KEY not set"
+            else:
+                r = http_requests.get(
+                    f"{TWITTER_BASE_URL}/twitter/user/info",
+                    headers={"X-API-Key": TWITTERAPI_KEY},
+                    params={"userName": "elonmusk"},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                name = r.json().get("data", {}).get("name", "?")
+                result["ok"] = True
+                result["detail"] = f"Profile fetched: {name}"
+
+        elif service == "youtube":
+            if not YOUTUBE_API_KEY:
+                result["detail"] = "YOUTUBE_API_KEY not set"
+            else:
+                r = http_requests.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={"q": "test", "key": YOUTUBE_API_KEY, "part": "snippet", "maxResults": 1},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                count = len(r.json().get("items", []))
+                result["ok"] = True
+                result["detail"] = f"Search returned {count} result(s)"
+
+        elif service == "redis":
+            if not REDIS_URL:
+                result["detail"] = "REDIS_URL not set"
+            else:
+                r = _redis_client()
+                if not r:
+                    result["detail"] = "Redis client creation failed"
+                else:
+                    r.ping()
+                    result["ok"] = True
+                    result["detail"] = "PING OK"
+
+        else:
+            result["detail"] = f"Unknown service: {service}"
+
+    except Exception as e:
+        result["detail"] = str(e)[:300]
+
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

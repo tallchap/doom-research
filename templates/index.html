@@ -66,6 +66,29 @@
       </div>
     </div>
 
+      <section class="card debug-card">
+        <div class="debug-header" id="debugToggle">
+          <h2>Debug</h2>
+          <span class="debug-arrow" id="debugArrow">&#9662;</span>
+        </div>
+        <div id="debugBody" class="debug-body" style="display:none">
+          <button id="checkEnvBtn" class="small">Check Env Vars</button>
+          <div id="envResults" class="debug-results"></div>
+
+          <div class="debug-separator"></div>
+          <p class="debug-label">Service Connectivity Tests</p>
+          <div class="debug-tests">
+            <button class="small test-btn" data-service="anthropic">Test Anthropic</button>
+            <button class="small test-btn" data-service="openai">Test OpenAI</button>
+            <button class="small test-btn" data-service="tavily">Test Tavily</button>
+            <button class="small test-btn" data-service="twitter">Test Twitter</button>
+            <button class="small test-btn" data-service="youtube">Test YouTube</button>
+            <button class="small test-btn" data-service="redis">Test Redis</button>
+          </div>
+          <div id="testResults" class="debug-results"></div>
+        </div>
+      </section>
+
       <footer class="version-footer">Build {{ git_version }}</footer>
     </main>
 
@@ -454,6 +477,72 @@
         if (json.ok) {
           el('researchStatus').textContent = `Research status: ${json.status}`;
         }
+      });
+
+      /* ── Debug panel ── */
+      el('debugToggle').addEventListener('click', () => {
+        const body = el('debugBody');
+        const arrow = el('debugArrow');
+        if (body.style.display === 'none') {
+          body.style.display = 'block';
+          arrow.innerHTML = '&#9652;';
+        } else {
+          body.style.display = 'none';
+          arrow.innerHTML = '&#9662;';
+        }
+      });
+
+      el('checkEnvBtn').addEventListener('click', async () => {
+        el('envResults').innerHTML = '<span class="muted">Checking...</span>';
+        try {
+          const res = await fetch('/debug/env');
+          const json = await res.json();
+          let html = '<div class="debug-grid">';
+          html += '<strong>Env Vars</strong><br>';
+          for (const [k, v] of Object.entries(json.env_vars)) {
+            const badge = v ? '<span class="badge badge-ok">SET</span>' : '<span class="badge badge-bad">MISSING</span>';
+            html += `<div class="debug-row">${badge} ${k}</div>`;
+          }
+          html += '<br><strong>Config</strong><br>';
+          for (const [k, v] of Object.entries(json.config)) {
+            html += `<div class="debug-row"><span class="debug-val">${v}</span> ${k}</div>`;
+          }
+          html += '</div>';
+          el('envResults').innerHTML = html;
+        } catch (e) {
+          el('envResults').innerHTML = `<span class="error">${e.message}</span>`;
+        }
+      });
+
+      document.querySelectorAll('.test-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const service = btn.dataset.service;
+          btn.disabled = true;
+          btn.textContent = `Testing ${service}...`;
+          const results = el('testResults');
+
+          try {
+            const res = await fetch('/debug/test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ service }),
+            });
+            const json = await res.json();
+            const badge = json.ok ? '<span class="badge badge-ok">OK</span>' : '<span class="badge badge-bad">FAIL</span>';
+            const row = document.createElement('div');
+            row.className = 'debug-row';
+            row.innerHTML = `${badge} <strong>${service}</strong>: ${json.detail}`;
+            results.prepend(row);
+          } catch (e) {
+            const row = document.createElement('div');
+            row.className = 'debug-row';
+            row.innerHTML = `<span class="badge badge-bad">ERR</span> <strong>${service}</strong>: ${e.message}`;
+            results.prepend(row);
+          }
+
+          btn.disabled = false;
+          btn.textContent = `Test ${service.charAt(0).toUpperCase() + service.slice(1)}`;
+        });
       });
 
     </script>
