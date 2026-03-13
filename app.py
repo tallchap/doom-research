@@ -995,40 +995,38 @@ def _run_deep_research(job_id: str) -> None:
             f"In the References section, include full dates for every entry."
         )
 
-        # --- Phase A + B: run web research and social enrichment in parallel ---
+        # --- Phase A: Perplexity web research only ---
         web_report = ""
         web_sources = []
         web_costs = 0.0
-        social_report = ""
 
-        with _SynthPool(max_workers=2) as pool:
-            web_future = pool.submit(_run_web_research, job, query, job_id)
-            social_future = pool.submit(_run_social_enrichment, job, payload)
+        try:
+            web_report, web_sources, web_costs = _run_web_research(job, query, job_id)
+        except Exception as e:
+            log_research(job, f"[web] Phase A failed: {e}")
 
-            # Collect results with timeouts
-            try:
-                web_report, web_sources, web_costs = web_future.result(timeout=300)
-            except Exception as e:
-                log_research(job, f"[web] Phase A failed: {e}")
+        if not web_report:
+            raise RuntimeError("Web research failed — no data")
 
-            try:
-                social_report = social_future.result(timeout=120)
-            except Exception as e:
-                log_research(job, f"[social] Phase B failed: {e}")
+        # # --- Phase B: Social enrichment (commented out) ---
+        # social_report = ""
+        # try:
+        #     social_report = _run_social_enrichment(job, payload)
+        # except Exception as e:
+        #     log_research(job, f"[social] Phase B failed: {e}")
 
-        if not web_report and not social_report:
-            raise RuntimeError("Both web and social research failed — no data to synthesize")
+        # # --- Phase C: Claude synthesis (commented out) ---
+        # final_report, synth_model, synth_usage = _synthesize_report(
+        #     job, web_report, social_report, web_sources,
+        #     subject, payload.get('research_prompt', '')
+        # )
 
-        # --- Phase C: Claude synthesis ---
-        final_report, synth_model, synth_usage = _synthesize_report(
-            job, web_report, social_report, web_sources,
-            subject, payload.get('research_prompt', '')
-        )
+        # # --- Phase D: Verify links and rewrite if fakes found (commented out) ---
+        # verified, dead = _verify_urls(final_report, job)
+        # if dead:
+        #     final_report = _rewrite_without_fake_sources(final_report, dead, job)
 
-        # --- Phase D: Verify links and rewrite if fakes found ---
-        verified, dead = _verify_urls(final_report, job)
-        if dead:
-            final_report = _rewrite_without_fake_sources(final_report, dead, job)
+        final_report = web_report
 
         # Append sources summary
         sources_summary = ""
@@ -1045,8 +1043,8 @@ def _run_deep_research(job_id: str) -> None:
                 job.finished_at = time.time()
                 return
             job.report = full_report[:60000]
-            job.model_used = f"perplexity ({PERPLEXITY_MODEL}) + {synth_model}"
-            job.tool_used = "perplexity + claude-synthesis"
+            job.model_used = f"perplexity ({PERPLEXITY_MODEL})"
+            job.tool_used = "perplexity"
             job.status = "done"
             job.finished_at = time.time()
             job.input_tokens = synth_usage.get("input_tokens", 0)
