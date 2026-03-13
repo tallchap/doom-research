@@ -1,4 +1,3 @@
-import asyncio
 import os
 import re
 import json
@@ -51,26 +50,9 @@ FALLBACK_MODELS = [
 WEB_SEARCH_TOOL_TYPES = ["web_search_20260209", "web_search_20250305"]
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# GPT Researcher config
-GPTR_ENABLED = os.getenv("GPTR_ENABLED", "true").lower() == "true"
-GPTR_LLM_PROVIDER = os.getenv("GPTR_LLM_PROVIDER", "openai")  # openai, anthropic, etc.
-GPTR_FAST_LLM = os.getenv("GPTR_FAST_LLM", "openai:gpt-4o-mini")
-GPTR_SMART_LLM = os.getenv("GPTR_SMART_LLM", "openai:gpt-5.4")
-GPTR_STRATEGIC_LLM = os.getenv("GPTR_STRATEGIC_LLM", "openai:o3")
-GPTR_REPORT_TYPE = os.getenv("GPTR_REPORT_TYPE", "research_report")
-GPTR_MAX_SEARCH_RESULTS = int(os.getenv("GPTR_MAX_SEARCH_RESULTS", "20"))
-GPTR_MIN_SOURCES = int(os.getenv("GPTR_MIN_SOURCES", "8"))
-GPTR_MAX_PASSES = int(os.getenv("GPTR_MAX_PASSES", "2"))
-GPTR_RETRIEVER = os.getenv("GPTR_RETRIEVER", "tavily")
-
-# Map GPTR_* settings to the unprefixed env vars that GPT Researcher reads.
-# Done once at startup to avoid repeated process-global mutations in threads.
-if GPTR_ENABLED:
-    os.environ["FAST_LLM"] = GPTR_FAST_LLM
-    os.environ["SMART_LLM"] = GPTR_SMART_LLM
-    os.environ["STRATEGIC_LLM"] = GPTR_STRATEGIC_LLM
-    os.environ["MAX_SEARCH_RESULTS_PER_QUERY"] = str(GPTR_MAX_SEARCH_RESULTS)
-    os.environ["RETRIEVER"] = GPTR_RETRIEVER
+# Perplexity config
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
+PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar-deep-research")
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 RESEARCH_QUEUE_NAME = os.getenv("RESEARCH_QUEUE_NAME", "research_jobs")
@@ -722,110 +704,49 @@ def generate_with_claude(prompt: str, deep_research: bool = False) -> Tuple[str,
     )
 
 
-# ── GPT Researcher integration ──
-
-class _GptrLogsHandler:
-    """Custom logs handler that bridges GPT Researcher progress into ResearchJobState logs."""
-
-    def __init__(self, job_id: str):
-        self._job_id = job_id
-        self.logs: List[Dict[str, Any]] = []
-
-    async def send_json(self, data: Dict[str, Any]) -> None:
-        self.logs.append(data)
-        content = data.get("output", data.get("content", ""))
-        if isinstance(content, str) and content.strip():
-            msg = content.strip()[:4000]
-        else:
-            msg = json.dumps(data, default=str)[:4000]
-        with research_lock:
-            job = RESEARCH_JOBS.get(self._job_id)
-            if job and len(job.logs) < 800:
-                log_research(job, msg)
-
+# ── Perplexity deep research integration ──
 
 def _run_web_research(job, query, job_id):
-    """Phase A: Run GPTR web research only (no social enrichment)."""
-    from gpt_researcher import GPTResearcher
-
-    log_research(job, "[web] Phase A started — GPTR web research")
+    """Phase A: Run Perplexity deep research."""
+    log_research(job, "[web] Phase A started — Perplexity deep research")
+    log_research(job, f"[web] Model: {PERPLEXITY_MODEL}")
     log_research(job, f"[web] Query: {query[:500]}")
-    log_research(job, f"[web] LLM: {GPTR_LLM_PROVIDER} | Smart: {GPTR_SMART_LLM} | Fast: {GPTR_FAST_LLM}")
 
-    logs_handler = _GptrLogsHandler(job_id)
+    if not PERPLEXITY_API_KEY:
+        raise RuntimeError("PERPLEXITY_API_KEY not set")
 
-    def _normalize_source(source):
-        if isinstance(source, str):
-            return source.strip()
-        if isinstance(source, dict):
-            return str(source.get("url") or source.get("source") or source.get("link") or "").strip()
-        return str(source).strip()
+    resp = http_requests.post(
+        "https://api.perplexity.ai/chat/completions",
+        headers={
+            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": PERPLEXITY_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a thorough research assistant. Provide detailed, well-cited research reports with inline citations.",
+                },
+                {"role": "user", "content": query},
+            ],
+        },
+        timeout=300,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-    def _has_inline_citations(text):
-        return bool(re.search(r"\[[0-9]+\]", text or "") or re.search(r"https?://", text or ""))
+    web_report = data["choices"][0]["message"]["content"]
+    citations = data.get("citations", [])
+    all_sources = citations if isinstance(citations, list) else []
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    pass_reports = []
-    all_sources = []
-    total_costs = 0.0
-    try:
-        pass_count = max(1, min(4, GPTR_MAX_PASSES))
-        for pass_idx in range(pass_count):
-            pass_query = query
-            if pass_idx > 0:
-                pass_query = (
-                    query
-                    + "\n\nSecond pass requirements: expand coverage with additional independent sources, "
-                    + "prioritize primary evidence, and include inline citations for factual claims."
-                )
+    # Fallback: extract URLs from report if no citations returned
+    if not all_sources and web_report:
+        urls = re.findall(r'https?://[^\s\)\]>"]+', web_report)
+        all_sources = list(dict.fromkeys(u.rstrip(".,;:") for u in urls))
 
-            log_research(job, f"[web] Research pass {pass_idx + 1}/{pass_count} started")
-            researcher = GPTResearcher(
-                query=pass_query,
-                report_type=GPTR_REPORT_TYPE,
-                report_source="online",
-                tone="informative",
-                websocket=logs_handler,
-            )
-
-            loop.run_until_complete(researcher.conduct_research())
-            pass_report = loop.run_until_complete(researcher.write_report())
-            pass_reports.append(pass_report or "")
-
-            costs = researcher.get_costs()
-            if isinstance(costs, (int, float)):
-                total_costs += float(costs)
-
-            raw_sources = researcher.get_research_sources() or []
-            normalized = [s for s in (_normalize_source(x) for x in raw_sources) if s]
-            for src in normalized:
-                if src not in all_sources:
-                    all_sources.append(src)
-
-            # Fallback: extract URLs from report text when get_research_sources() returns empty
-            if not all_sources and pass_reports[-1]:
-                urls_in_report = re.findall(r'https?://[^\s\)\]>"]+', pass_reports[-1])
-                for url in urls_in_report:
-                    url = url.rstrip(".,;:")
-                    if url not in all_sources:
-                        all_sources.append(url)
-
-            latest_report = pass_reports[-1]
-            has_citations = _has_inline_citations(latest_report)
-            log_research(job, f"[web] Pass {pass_idx + 1}: sources={len(all_sources)} citations={'yes' if has_citations else 'no'}")
-
-            if len(all_sources) >= GPTR_MIN_SOURCES and has_citations:
-                log_research(job, "[web] Quality gate met")
-                break
-            if pass_idx + 1 < pass_count:
-                log_research(job, "[web] Quality gate not met; running another pass")
-    finally:
-        loop.close()
-
-    web_report = (pass_reports[-1] if pass_reports else "") or ""
-    log_research(job, f"[web] Phase A done — {len(all_sources)} sources, cost=${total_costs:.4f}")
-    return web_report, all_sources, total_costs
+    log_research(job, f"[web] Phase A done — {len(all_sources)} sources")
+    return web_report, all_sources, 0.0
 
 
 def _run_social_enrichment(job, payload):
@@ -938,8 +859,8 @@ def _synthesize_report(job, web_report, social_report, web_sources, subject, res
         return fallback or "No report generated.", "fallback", {"input_tokens": 0, "output_tokens": 0}
 
 
-def _run_gptr_research(job_id: str) -> None:
-    """Run parallel deep research: web (GPTR) + social (Twitter/YouTube), then Claude synthesis."""
+def _run_deep_research(job_id: str) -> None:
+    """Run parallel deep research: web (Perplexity) + social (Twitter/YouTube), then Claude synthesis."""
     from concurrent.futures import ThreadPoolExecutor as _SynthPool
 
     with research_lock:
@@ -1014,13 +935,13 @@ def _run_gptr_research(job_id: str) -> None:
                 job.finished_at = time.time()
                 return
             job.report = full_report[:60000]
-            job.model_used = f"gpt-researcher ({GPTR_SMART_LLM}) + {synth_model}"
-            job.tool_used = "gpt-researcher + claude-synthesis"
+            job.model_used = f"perplexity ({PERPLEXITY_MODEL}) + {synth_model}"
+            job.tool_used = "perplexity + claude-synthesis"
             job.status = "done"
             job.finished_at = time.time()
             job.input_tokens = synth_usage.get("input_tokens", 0)
             job.output_tokens = synth_usage.get("output_tokens", 0)
-            log_research(job, f"Deep research completed. GPTR cost: ${web_costs:.4f}")
+            log_research(job, "Deep research completed.")
             if web_sources:
                 log_research(job, f"Web sources: {len(web_sources)}")
     except Exception as e:
@@ -1085,8 +1006,8 @@ def run_research_job(job_id: str):
             return
         mode = job.mode
 
-    if mode == "deep" and GPTR_ENABLED:
-        _run_gptr_research(job_id)
+    if mode == "deep" and PERPLEXITY_API_KEY:
+        _run_deep_research(job_id)
     else:
         _run_api_research_job(job_id)
 
@@ -1212,21 +1133,14 @@ def debug_env():
     return jsonify({
         "env_vars": {
             "ANTHROPIC_API_KEY": bool(API_KEY),
-            "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
-            "TAVILY_API_KEY": bool(os.getenv("TAVILY_API_KEY")),
+            "PERPLEXITY_API_KEY": bool(PERPLEXITY_API_KEY),
             "TWITTERAPI_KEY": bool(TWITTERAPI_KEY),
             "YOUTUBE_API_KEY": bool(YOUTUBE_API_KEY),
             "REDIS_URL": bool(REDIS_URL),
         },
         "config": {
             "ANTHROPIC_MODEL": MODEL or "(default fallback)",
-            "GPTR_ENABLED": GPTR_ENABLED,
-            "GPTR_SMART_LLM": GPTR_SMART_LLM,
-            "GPTR_FAST_LLM": GPTR_FAST_LLM,
-            "GPTR_STRATEGIC_LLM": GPTR_STRATEGIC_LLM,
-            "GPTR_RETRIEVER": GPTR_RETRIEVER,
-            "GPTR_MAX_PASSES": GPTR_MAX_PASSES,
-            "GPTR_MIN_SOURCES": GPTR_MIN_SOURCES,
+            "PERPLEXITY_MODEL": PERPLEXITY_MODEL,
             "RESEARCH_USE_WORKER": RESEARCH_USE_WORKER,
         },
     })
@@ -1254,35 +1168,26 @@ def debug_test():
                 result["ok"] = True
                 result["detail"] = f"Model responded: {_extract_text_from_message(msg)[:50]}"
 
-        elif service == "openai":
-            oai_key = os.getenv("OPENAI_API_KEY", "")
-            if not oai_key:
-                result["detail"] = "OPENAI_API_KEY not set"
-            else:
-                import openai
-                client = openai.OpenAI(api_key=oai_key)
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    max_tokens=10,
-                    messages=[{"role": "user", "content": "Say OK"}],
-                )
-                result["ok"] = True
-                result["detail"] = f"Model responded: {resp.choices[0].message.content[:50]}"
-
-        elif service == "tavily":
-            tavily_key = os.getenv("TAVILY_API_KEY", "")
-            if not tavily_key:
-                result["detail"] = "TAVILY_API_KEY not set"
+        elif service == "perplexity":
+            if not PERPLEXITY_API_KEY:
+                result["detail"] = "PERPLEXITY_API_KEY not set"
             else:
                 r = http_requests.post(
-                    "https://api.tavily.com/search",
-                    json={"api_key": tavily_key, "query": "test", "max_results": 1},
-                    timeout=10,
+                    "https://api.perplexity.ai/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "sonar",
+                        "messages": [{"role": "user", "content": "Say OK"}],
+                    },
+                    timeout=15,
                 )
                 r.raise_for_status()
-                results_count = len(r.json().get("results", []))
+                content = r.json()["choices"][0]["message"]["content"]
                 result["ok"] = True
-                result["detail"] = f"Search returned {results_count} result(s)"
+                result["detail"] = f"Model responded: {content[:50]}"
 
         elif service == "twitter":
             if not TWITTERAPI_KEY:

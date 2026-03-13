@@ -11,30 +11,10 @@ services:
         value: claude-opus-4-6
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
+      - key: PERPLEXITY_API_KEY
         sync: false
-      - key: TAVILY_API_KEY
-        sync: false
-      - key: GPTR_ENABLED
-        value: "true"
-      - key: GPTR_LLM_PROVIDER
-        value: openai
-      - key: GPTR_FAST_LLM
-        value: "openai:gpt-4o-mini"
-      - key: GPTR_SMART_LLM
-        value: "openai:gpt-5.4"
-      - key: GPTR_STRATEGIC_LLM
-        value: "openai:o3"
-      - key: GPTR_MAX_SEARCH_RESULTS
-        value: "10"
-      - key: GPTR_MIN_SOURCES
-        value: "8"
-      - key: GPTR_MAX_PASSES
-        value: "2"
-      - key: GPTR_REPORT_TYPE
-        value: research_report
-      - key: GPTR_RETRIEVER
-        value: tavily
+      - key: PERPLEXITY_MODEL
+        value: sonar-deep-research
       - key: REDIS_URL
         sync: false
       - key: RESEARCH_USE_WORKER
@@ -58,30 +38,10 @@ services:
         value: claude-opus-4-6
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
+      - key: PERPLEXITY_API_KEY
         sync: false
-      - key: TAVILY_API_KEY
-        sync: false
-      - key: GPTR_ENABLED
-        value: "true"
-      - key: GPTR_LLM_PROVIDER
-        value: openai
-      - key: GPTR_FAST_LLM
-        value: "openai:gpt-4o-mini"
-      - key: GPTR_SMART_LLM
-        value: "openai:gpt-5.4"
-      - key: GPTR_STRATEGIC_LLM
-        value: "openai:o3"
-      - key: GPTR_MAX_SEARCH_RESULTS
-        value: "10"
-      - key: GPTR_MIN_SOURCES
-        value: "8"
-      - key: GPTR_MAX_PASSES
-        value: "2"
-      - key: GPTR_REPORT_TYPE
-        value: research_report
-      - key: GPTR_RETRIEVER
-        value: tavily
+      - key: PERPLEXITY_MODEL
+        value: sonar-deep-research
       - key: REDIS_URL
         sync: false
       - key: RESEARCH_USE_WORKER
