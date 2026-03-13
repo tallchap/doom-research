@@ -811,6 +811,14 @@ def _synthesize_report(job, web_report, social_report, web_sources, subject, res
             f"## SOCIAL & VIDEO SOURCES (Twitter profile/tweets + YouTube transcripts)\n\n{social_report}\n\n"
         )
 
+    # Add verified source URLs so Claude knows which URLs are real
+    if web_sources:
+        sources_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(web_sources))
+        prompt_parts.append(
+            f"## VERIFIED SOURCE URLS\n"
+            f"The following URLs were returned by the search engine and are verified real:\n{sources_list}\n\n"
+        )
+
     prompt_parts.append(
         "Produce a final structured report with these sections:\n"
         "1) **Executive Snapshot** (5-8 bullets summarizing key findings from ALL sources)\n"
@@ -819,7 +827,12 @@ def _synthesize_report(job, web_report, social_report, web_sources, subject, res
         "4) **Outreach Angles** (practical approaches based on findings)\n"
         "5) **Unknowns / Next Verification Steps**\n"
         "6) **References** (all sources cited, with dates)\n\n"
-        "IMPORTANT RULES:\n"
+        "CRITICAL — ANTI-HALLUCINATION RULES:\n"
+        "- DO NOT invent, modify, or guess URLs. Only use URLs that appear VERBATIM in the web research, social data, or verified source list above.\n"
+        "- If a claim has no source URL in the provided data, write 'No URL available' — NEVER fabricate a URL.\n"
+        "- DO NOT fabricate quotes. Only include direct quotes that appear VERBATIM in the source material. If paraphrasing, clearly mark it as paraphrase.\n"
+        "- Every URL in the Evidence Matrix and References MUST appear in the data above. If it does not, do not include it.\n\n"
+        "OTHER RULES:\n"
         "- Incorporate findings from BOTH web research AND social/video sources. Do not ignore either.\n"
         "- If Twitter or YouTube data reveals opinions, quotes, or positions, include them prominently.\n"
         "- All citations must include publication dates: (Source, YYYY-MM-DD).\n"
