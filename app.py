@@ -745,6 +745,15 @@ def _run_web_research(job, query, job_id):
         urls = re.findall(r'https?://[^\s\)\]>"]+', web_report)
         all_sources = list(dict.fromkeys(u.rstrip(".,;:") for u in urls))
 
+    # Replace [N] citation markers with clickable markdown links
+    if all_sources:
+        def _replace_citation(m):
+            idx = int(m.group(1)) - 1  # citations are 1-indexed
+            if 0 <= idx < len(all_sources):
+                return f"([{idx+1}]({all_sources[idx]}))"
+            return m.group(0)
+        web_report = re.sub(r'\[(\d+)\]', _replace_citation, web_report)
+
     log_research(job, f"[web] Phase A done — {len(all_sources)} sources")
     return web_report, all_sources, 0.0
 
@@ -1047,8 +1056,8 @@ def _run_deep_research(job_id: str) -> None:
             job.tool_used = "perplexity"
             job.status = "done"
             job.finished_at = time.time()
-            job.input_tokens = synth_usage.get("input_tokens", 0)
-            job.output_tokens = synth_usage.get("output_tokens", 0)
+            job.input_tokens = 0
+            job.output_tokens = 0
             log_research(job, "Deep research completed.")
             if web_sources:
                 log_research(job, f"Web sources: {len(web_sources)}")
