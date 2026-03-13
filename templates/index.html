@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Doom Research</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="costBar" class="cost-bar">
+      <span id="costTokens">Tokens: 0 in / 0 out</span>
+      <span id="costEstimate">Est: $0.00</span>
+    </div>
+    <main class="container">
+      <h1>Doom Research</h1>
+      <p class="sub">Deep research reports: web + Twitter + YouTube → Claude synthesis</p>
+
+      <section class="card">
+        <h2>Research Contact</h2>
+
+        <label>Contact Name *</label>
+        <input id="contact_name" type="text" placeholder="Name to research" />
+        <div class="quick-fill"><button type="button" class="chip" onclick="el('contact_name').value='Arnold Schwarzenegger'">Arnold Schwarzenegger</button></div>
+
+        <label>Research Prompt *</label>
+        <textarea id="research_prompt" rows="4" placeholder="What should the report focus on?"></textarea>
+        <div class="quick-fill"><button type="button" class="chip" onclick="el('research_prompt').value='Find me their takes on AI'">Find Me Their Takes on AI</button></div>
+
+        <label>Research Mode</label>
+        <select id="research_mode">
+          <option value="standard">Standard</option>
+          <option value="deep">Deep (GPT Researcher)</option>
+        </select>
+
+        <button id="researchBtn">Run Research</button>
+        <button id="cancelResearchBtn" class="secondary">Cancel Research</button>
+        <div id="researchError" class="error"></div>
+        <div id="researchStatus" class="muted"></div>
+        <div id="researchModelSub" class="model-sub"></div>
+
+        <button id="openReportBtn" class="open-report-btn" disabled>
+          <span>&#128196;</span> View Research Report
+        </button>
+        <div id="researchReport" class="report-pane"></div>
+        <pre id="researchLogs" class="small-logs"></pre>
+      </section>
+
+    <!-- Research report side-panel -->
+    <div id="reportOverlay" class="report-panel-overlay">
+      <div id="reportPanel" class="report-panel">
+        <div class="report-panel-resize" id="reportPanelResize"></div>
+        <div class="report-panel-header">
+          <div>
+            <h3>Research Report</h3>
+            <span class="panel-meta" id="reportPanelMeta"></span>
+          </div>
+          <button class="report-panel-close" id="reportPanelClose" title="Close">&times;</button>
+        </div>
+        <div class="report-panel-body" id="reportPanelBody">
+          <p style="opacity:0.5">No report generated.</p>
+        </div>
+        <div class="report-panel-logs-toggle" id="reportLogsToggle">
+          &#9662; Logs
+        </div>
+        <pre class="report-panel-logs" id="reportPanelLogs"></pre>
+      </div>
+    </div>
+
+      <footer class="version-footer">Build {{ git_version }}</footer>
+    </main>
+
+    <script>
+      let currentResearchJobId = null;
+      let researchPollTimer = null;
+      let lastReportRaw = '';
+
+      const el = (id) => document.getElementById(id);
+
+      /* ── Session cost tracker ── */
+      const sessionTokens = { input: 0, output: 0 };
+      const trackedTokenSources = new Set();
+
+      const MODEL_COSTS = {
+        'claude-opus-4-6': { input: 15, output: 75 },
+        'claude-sonnet-4-6': { input: 3, output: 15 },
+        'claude-haiku-4-5': { input: 0.8, output: 4 },
+      };
+
+      function addTokens(sourceKey, inputTokens, outputTokens, model) {
+        if (!inputTokens && !outputTokens) return;
+        if (trackedTokenSources.has(sourceKey)) return;
+        trackedTokenSources.add(sourceKey);
+        sessionTokens.input += inputTokens || 0;
+        sessionTokens.output += outputTokens || 0;
+        updateCostBar(model);
+      }
+
+      function updateCostBar(model) {
+        const fmtK = (n) => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : n;
+        el('costTokens').textContent = `Tokens: ${fmtK(sessionTokens.input)} in / ${fmtK(sessionTokens.output)} out`;
+        // Estimate cost — default to opus rates
+        let rates = MODEL_COSTS['claude-opus-4-6'];
+        if (model) {
+          for (const [k, v] of Object.entries(MODEL_COSTS)) {
+            if (model.includes(k)) { rates = v; break; }
+          }
+        }
+        const cost = (sessionTokens.input * rates.input + sessionTokens.output * rates.output) / 1_000_000;
+        el('costEstimate').textContent = `Est: $${cost.toFixed(4)}`;
+      }
+
+      /* ── Markdown-like report → HTML parser ── */
+      function reportToHtml(raw) {
+        if (!raw || !raw.trim()) return '<p style="opacity:0.5">No report generated.</p>';
+        let text = raw;
+
+        // --- Extract URLs and markdown links BEFORE escaping to preserve & in query params ---
+        const urlPlaceholders = [];
+        // First: extract markdown links [text](url)
+        text = text.replace(
+          /\[([^\]]+)\]\(([^)]+)\)/g,
+          (match, label, url) => {
+            if (/^https?:\/\//i.test(url)) {
+              const idx = urlPlaceholders.length;
+              urlPlaceholders.push({ type: 'mdlink', url, label });
+              return `%%URLPH_${idx}%%`;
+            }
+            return `${label} (${url})`; // non-http scheme: render as plain text
+          }
+        );
+        // Second: extract bare URLs
+        text = text.replace(
+          /\bhttps?:\/\/[^\s<>)\]]+/g,
+          (url) => {
+            const idx = urlPlaceholders.length;
+            urlPlaceholders.push({ type: 'bare', url });
+            return `%%URLPH_${idx}%%`;
+          }
+        );
+
+        // Escape HTML entities (including quotes to prevent attribute injection)
+        text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+        // Restore URL placeholders as proper <a> tags (URLs kept unescaped in href)
+        text = text.replace(/%%URLPH_(\d+)%%/g, (_, idx) => {
+          const ph = urlPlaceholders[parseInt(idx)];
+          const safeUrl = ph.url.replace(/"/g, '&quot;');
+          const displayUrl = ph.url.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          if (ph.type === 'mdlink') {
+            const displayLabel = ph.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return `<a href="${safeUrl}" target="_blank" rel="noopener">${displayLabel}</a>`;
+          }
+          return `<a href="${safeUrl}" target="_blank" rel="noopener">${displayUrl}</a>`;
+        });
+
+        const lines = text.split('\n');
+        let html = '';
+        let inTable = false;
+        let inList = false;
+        let listType = '';
+
+        function closeList() {
+          if (inList) { html += listType === 'ol' ? '</ol>' : '</ul>'; inList = false; }
+        }
+        function closeTable() {
+          if (inTable) { html += '</tbody></table>'; inTable = false; }
+        }
+
+        for (let i = 0; i < lines.length; i++) {
+          let line = lines[i];
+
+          // --- (horizontal rule)
+          if (/^---+\s*$/.test(line.trim())) {
+            closeList(); closeTable();
+            html += '<hr>';
+            continue;
+          }
+
+          // Headings: # ## ### ####
+          const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
+          if (headingMatch) {
+            closeList(); closeTable();
+            const level = headingMatch[1].length;
+            html += `<h${level}>${formatInline(headingMatch[2])}</h${level}>`;
+            continue;
+          }
+
+          // Section headings like "1) Executive Snapshot" or "**Executive Snapshot**"
+          const numberedSection = line.match(/^\d+\)\s+\*?\*?(.+?)\*?\*?\s*$/);
+          if (numberedSection && !inTable) {
+            closeList(); closeTable();
+            html += `<h3>${formatInline(numberedSection[1])}</h3>`;
+            continue;
+          }
+
+          // --- Table handling (both | col | col | and col | col | col formats) ---
+          const isPipeRow = /\|/.test(line) && line.split('|').length >= 3 && !/^\s*$/.test(line);
+          const isStdTableRow = /^\|(.+\|)+\s*$/.test(line.trim());
+
+          if (isPipeRow || isStdTableRow) {
+            const cells = isStdTableRow
+              ? line.split('|').filter(c => c.trim() !== '')
+              : line.split('|').map(c => c.trim());
+
+            // Skip separator rows (------|------|------)
+            if (cells.every(c => /^[\s:-]+$/.test(c))) continue;
+
+            let treatAsTable = true;
+            if (!inTable) {
+              if (!isStdTableRow) {
+                const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
+                const prevHtml = html.slice(-50);
+                if (!(/\|/.test(nextLine) || /<\/h[34]>$/.test(prevHtml.trim()))) {
+                  treatAsTable = false;
+                }
+              }
+              if (treatAsTable) {
+                closeList();
+                inTable = true;
+                html += '<table><thead><tr>';
+                cells.forEach(c => html += `<th>${formatInline(c.trim())}</th>`);
+                html += '</tr></thead><tbody>';
+                continue;
+              }
+            } else {
+              html += '<tr>';
+              cells.forEach(c => html += `<td>${formatInline(c.trim())}</td>`);
+              html += '</tr>';
+              continue;
+            }
+          } else if (inTable) {
+            closeTable();
+          }
+
+          // Unordered list: - item or * item
+          const ulMatch = line.match(/^(\s*)[-*]\s+(.+)/);
+          if (ulMatch) {
+            closeTable();
+            if (!inList || listType !== 'ul') { closeList(); html += '<ul>'; inList = true; listType = 'ul'; }
+            html += `<li>${formatInline(ulMatch[2])}</li>`;
+            continue;
+          }
+
+          // Ordered list: 1. item (but not section headings with ")")
+          const olMatch = line.match(/^(\s*)\d+\.\s+(.+)/);
+          if (olMatch) {
+            closeTable();
+            if (!inList || listType !== 'ol') { closeList(); html += '<ol>'; inList = true; listType = 'ol'; }
+            html += `<li>${formatInline(olMatch[2])}</li>`;
+            continue;
+          }
+
+          // Blockquote
+          if (line.match(/^&gt;\s*(.*)/)) {
+            closeList(); closeTable();
+            html += `<blockquote>${formatInline(line.replace(/^&gt;\s*/, ''))}</blockquote>`;
+            continue;
+          }
+
+          // Empty line
+          if (line.trim() === '') {
+            closeList(); closeTable();
+            continue;
+          }
+
+          // Plain paragraph
+          closeList(); closeTable();
+          html += `<p>${formatInline(line)}</p>`;
+        }
+
+        closeList(); closeTable();
+        return html;
+      }
+
+      function formatInline(text) {
+        // Bold: **text** or __text__
+        text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+        // Italic: *text* or _text_
+        text = text.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
+        // Inline code
+        text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+        // Confidence tags — only match standalone words not inside HTML tags
+        text = text.replace(/(?<![<\w\/"-])(\bHigh\b)(?![^<]*>)/gi, (m) => `<span class="confidence-high">${m}</span>`);
+        text = text.replace(/(?<![<\w\/"-])(\bMedium\b)(?![^<]*>)/gi, (m) => `<span class="confidence-medium">${m}</span>`);
+        text = text.replace(/(?<![<\w\/"-])(\bLow\b)(?![^<]*>)/gi, (m) => `<span class="confidence-low">${m}</span>`);
+        return text;
+      }
+
+      /* ── Side panel logic ── */
+      function openReportPanel() {
+        el('reportOverlay').classList.add('open');
+        document.body.style.overflow = 'hidden';
+      }
+      function closeReportPanel() {
+        el('reportOverlay').classList.remove('open');
+        document.body.style.overflow = '';
+      }
+
+      el('openReportBtn').addEventListener('click', openReportPanel);
+      el('reportPanelClose').addEventListener('click', closeReportPanel);
+      el('reportOverlay').addEventListener('click', (e) => {
+        if (e.target === el('reportOverlay')) closeReportPanel();
+      });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeReportPanel();
+      });
+
+      // Logs toggle
+      el('reportLogsToggle').addEventListener('click', () => {
+        const logsEl = el('reportPanelLogs');
+        logsEl.classList.toggle('expanded');
+        el('reportLogsToggle').innerHTML = logsEl.classList.contains('expanded') ? '&#9652; Logs' : '&#9662; Logs';
+      });
+
+      // Resize handle
+      (function initResize() {
+        const handle = el('reportPanelResize');
+        const panel = el('reportPanel');
+        let startX, startW;
+
+        handle.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          startX = e.clientX;
+          startW = panel.offsetWidth;
+          handle.classList.add('active');
+          document.addEventListener('mousemove', onDrag);
+          document.addEventListener('mouseup', stopDrag);
+        });
+
+        function onDrag(e) {
+          const delta = startX - e.clientX;
+          const newW = Math.max(320, Math.min(window.innerWidth * 0.85, startW + delta));
+          panel.style.width = newW + 'px';
+        }
+
+        function stopDrag() {
+          handle.classList.remove('active');
+          document.removeEventListener('mousemove', onDrag);
+          document.removeEventListener('mouseup', stopDrag);
+        }
+      })();
+
+      function updateReportPanel(report, mode, modelUsed, toolUsed, logs) {
+        lastReportRaw = report || '';
+        const btn = el('openReportBtn');
+
+        if (lastReportRaw) {
+          btn.disabled = false;
+          btn.innerHTML = '<span>&#128196;</span> View Research Report';
+        } else {
+          btn.disabled = true;
+          btn.innerHTML = '<span>&#128196;</span> View Research Report';
+        }
+
+        // Render HTML into panel body
+        el('reportPanelBody').innerHTML = reportToHtml(lastReportRaw);
+
+        // Meta info
+        const parts = [];
+        if (mode) parts.push(mode);
+        if (modelUsed) parts.push(modelUsed);
+        if (toolUsed) parts.push(toolUsed);
+        el('reportPanelMeta').textContent = parts.join(' · ');
+
+        // Logs
+        el('reportPanelLogs').textContent = (logs || []).join('\n');
+      }
+
+      async function pollResearch(jobId) {
+        const res = await fetch(`/research_status?job_id=${jobId}`);
+        const json = await res.json();
+        if (!json.ok) {
+          el('researchError').textContent = json.error || 'Research status failed';
+          return;
+        }
+
+        el('researchStatus').textContent = `Research status: ${json.status} (${json.mode || 'standard'})`;
+        el('researchLogs').textContent = (json.logs || []).join('\n');
+
+        // Model subscript
+        const modelParts = [];
+        if (json.model_used) modelParts.push(json.model_used);
+        if (json.tool_used) modelParts.push(json.tool_used);
+        el('researchModelSub').textContent = modelParts.join(' · ');
+
+        // Track tokens
+        if (json.done && (json.input_tokens || json.output_tokens)) {
+          addTokens('research:' + jobId, json.input_tokens, json.output_tokens, json.model_used);
+        }
+
+        // Update side-panel content as data arrives
+        updateReportPanel(
+          json.report,
+          json.mode,
+          json.model_used,
+          json.tool_used,
+          json.logs
+        );
+
+        if (!json.done) {
+          researchPollTimer = setTimeout(() => pollResearch(jobId), 1200);
+          return;
+        }
+
+        if (json.error) {
+          el('researchError').textContent = json.error;
+          return;
+        }
+
+        // Auto-open the panel when research completes
+        if (json.report) {
+          openReportPanel();
+        }
+      }
+
+      el('researchBtn').addEventListener('click', async () => {
+        clearTimeout(researchPollTimer);
+        el('researchError').textContent = '';
+        el('researchStatus').textContent = 'Submitting research job...';
+        el('researchLogs').textContent = '';
+
+        const payload = {
+          contact_name: el('contact_name').value.trim(),
+          research_prompt: el('research_prompt').value.trim(),
+          mode: el('research_mode').value,
+        };
+
+        const res = await fetch('/research_contact', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const json = await res.json();
+        if (!json.ok) {
+          el('researchError').textContent = json.error || 'Research failed';
+          el('researchStatus').textContent = '';
+          return;
+        }
+
+        currentResearchJobId = json.job_id;
+        el('researchStatus').textContent = `Research status: ${json.status} (${json.mode || 'standard'})`;
+        pollResearch(json.job_id);
+      });
+
+      el('cancelResearchBtn').addEventListener('click', async () => {
+        if (!currentResearchJobId) return;
+        const res = await fetch('/research_cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: currentResearchJobId }),
+        });
+        const json = await res.json();
+        if (json.ok) {
+          el('researchStatus').textContent = `Research status: ${json.status}`;
+        }
+      });
+
+    </script>
+  </body>
+</html>
