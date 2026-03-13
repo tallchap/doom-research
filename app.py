@@ -872,6 +872,98 @@ def _synthesize_report(job, web_report, social_report, web_sources, subject, res
         return fallback or "No report generated.", "fallback", {"input_tokens": 0, "output_tokens": 0}
 
 
+def _verify_urls(report, job):
+    """Phase D1-D2: Extract URLs from report and verify via HTTP HEAD requests."""
+    from concurrent.futures import ThreadPoolExecutor as _VerifyPool
+
+    raw_urls = re.findall(r'https?://[^\s\)\]>"\'|]+', report)
+    # Deduplicate while preserving order
+    seen = set()
+    urls = []
+    for u in raw_urls:
+        u = u.rstrip(".,;:")
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    # Skip trusted domains (our own APIs provide these, and they block HEAD requests)
+    TRUSTED_DOMAINS = ("x.com", "twitter.com", "youtube.com", "youtu.be")
+    to_check = [u for u in urls if not any(d in u for d in TRUSTED_DOMAINS)]
+    trusted = [u for u in urls if any(d in u for d in TRUSTED_DOMAINS)]
+
+    log_research(job, f"[verify] Found {len(urls)} URLs ({len(to_check)} to check, {len(trusted)} trusted)")
+
+    if not to_check:
+        return urls, []
+
+    def _check_url(url):
+        try:
+            r = http_requests.head(url, timeout=5, allow_redirects=True,
+                                   headers={"User-Agent": "Mozilla/5.0 (research-verifier)"})
+            return url, r.status_code < 400
+        except Exception:
+            return url, False
+
+    verified = []
+    dead = []
+    with _VerifyPool(max_workers=10) as pool:
+        for url, alive in pool.map(_check_url, to_check):
+            if alive:
+                verified.append(url)
+            else:
+                dead.append(url)
+
+    log_research(job, f"[verify] Results: {len(verified)} alive, {len(dead)} dead")
+    if dead:
+        for d in dead:
+            log_research(job, f"[verify] DEAD: {d}")
+
+    return verified + trusted, dead
+
+
+def _rewrite_without_fake_sources(report, dead_urls, job):
+    """Phase D3-D4: Send report back to Claude to remove all content tied to fake URLs."""
+    log_research(job, f"[verify] Rewriting report to remove {len(dead_urls)} fake source(s)")
+
+    dead_list = "\n".join(f"{i+1}. {u}" for i, u in enumerate(dead_urls))
+
+    rewrite_prompt = (
+        "The following URLs in this research report have been verified as FAKE "
+        "(they return 404 or do not exist):\n\n"
+        f"{dead_list}\n\n"
+        "Rewrite the report below, removing:\n"
+        "- All Evidence Matrix rows citing any of these URLs\n"
+        "- All claims, analysis, or conclusions that relied on content from these URLs\n"
+        "- All References entries for these URLs\n"
+        "- Any sections that become empty after removal\n\n"
+        "Do NOT add new content or new URLs. Only remove fabricated content and adjust "
+        "the narrative to reflect what remains. If removing fake sources significantly "
+        "changes a conclusion, update the conclusion accordingly.\n\n"
+        "Return the complete rewritten report.\n\n"
+        "---\n\n"
+        f"{report}"
+    )
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=API_KEY, timeout=180.0)
+        model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+        msg = client.messages.create(
+            model=model_name,
+            max_tokens=8000,
+            temperature=0.2,
+            messages=[{"role": "user", "content": rewrite_prompt}],
+        )
+        result = _extract_text_from_message(msg)
+        usage = _extract_usage(msg)
+        log_research(job, f"[verify] Rewrite done ({usage.get('input_tokens', 0)} in / {usage.get('output_tokens', 0)} out)")
+        return result
+    except Exception as e:
+        log_research(job, f"[verify] Rewrite failed: {e} — returning original report")
+        return report
+
+
 def _run_deep_research(job_id: str) -> None:
     """Run parallel deep research: web (Perplexity) + social (Twitter/YouTube), then Claude synthesis."""
     from concurrent.futures import ThreadPoolExecutor as _SynthPool
@@ -932,6 +1024,11 @@ def _run_deep_research(job_id: str) -> None:
             job, web_report, social_report, web_sources,
             subject, payload.get('research_prompt', '')
         )
+
+        # --- Phase D: Verify links and rewrite if fakes found ---
+        verified, dead = _verify_urls(final_report, job)
+        if dead:
+            final_report = _rewrite_without_fake_sources(final_report, dead, job)
 
         # Append sources summary
         sources_summary = ""
